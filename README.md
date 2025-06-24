@@ -23,8 +23,8 @@ Official code of paper [Efficient Heatmap-Guided 6-Dof Grasp Detection in Clutte
 
 # Requirements
 
-- Python >= 3.8
-- PyTorch >= 1.10
+- Python >= 3.12
+- PyTorch >= 2.2 <2.3
 - pytorch3d
 - numpy==1.23.5
 - pandas
@@ -50,24 +50,26 @@ This code has been tested on Ubuntu20.04 with Cuda 11.1/11.3/11.6, Python3.8/3.9
 Get the code.
 
 ```bash
-git clone https://github.com/THU-VCLab/HGGD.git
+git clone https://github.com/Buriburizaem0n/HGGD_Elite_ROS.git
 ```
 
 Create new Conda environment.
 
 ```bash
-conda create -n hggd python=3.8
+conda create -n hggd python=3.12
 cd HGGD
 ```
 
 Please install [pytorch](https://pytorch.org/) and [pytorch3d](https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md) manually.
 
 ```bash
-# pytorch-1.11.0
-pip install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 --extra-index-url https://download.pytorch.org/whl/cu113
+# pytorch-2.2.2
+pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
 # pytorch3d
 pip install fvcore
-pip install --no-index --no-cache-dir pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py38_cu113_pyt1110/download.html
+wget https://anaconda.org/pytorch3d/pytorch3d/0.7.8/download/linux-64/pytorch3d-0.7.8-py312_cu121_pyt222.tar.bz2
+conda install pytorch3d-0.7.8-py312_cu121_pyt222.tar.bz2
+rm pytorch3d-0.7.8-py312_cu121_pyt222.tar.bz2
 ```
 
 Install other packages via Pip.
