@@ -1,0 +1,6 @@
+
+string input
+---
+
+bool success
+visualization_msgs/MarkerArray output
