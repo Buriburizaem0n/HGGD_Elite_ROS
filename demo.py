@@ -62,7 +62,12 @@ class PointCloudHelper:
         self.all_points_num = all_points_num
         self.output_shape = (80, 45)
         # get intrinsics
-        intrinsics = get_camera_intrinsic()
+        fx = 906.2641; fy = 906.7697
+        cx = 651.0449; cy = 357.4035
+        intrinsics = np.array([[fx, 0, cx],
+                            [0, fy, cy],
+                            [0,  0,  1]])
+        # intrinsics = get_camera_intrinsic()
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         cx, cy = intrinsics[0, 2], intrinsics[1, 2]
         # cal x, y
@@ -293,7 +298,7 @@ if __name__ == '__main__':
     # read image and conver to tensor
     ori_depth = np.array(Image.open(args.depth_path)).astype(np.float32)
     ori_rgb = np.array(Image.open(args.rgb_path)) / 255.0
-    ori_depth = np.clip(ori_depth, 0.0, 1000.0)
+    ori_depth = np.clip(ori_depth, 0.0, 2500.0)
     ori_rgb = torch.from_numpy(ori_rgb).permute(2, 1, 0)[None]
     ori_rgb = ori_rgb.to(device='cuda', dtype=torch.float32)
     ori_depth = torch.from_numpy(ori_depth).T[None]

@@ -1,276 +1,402 @@
 #!/usr/bin/env python3
-"""
-ROS 2 Anchor‑Local Grasp Detection Node — 纯 Pose → Marker 版
+# -*- coding: utf-8 -*-
 
-• 订阅：
-    /camera/d435/color/image_raw                      (sensor_msgs/Image, rgb8)
-    /camera/d435/aligned_depth_to_color/image_raw      (sensor_msgs/Image, 16UC1 或 32FC1)
-• 服务：get_grasps (grasp_msgs/srv/GetGrasp)   — 与旧接口完全一致
-• 发布：/grasp_markers (visualization_msgs/Marker)
-
-与上一版相比：
-  1. **完全去掉 GraspGroup 依赖**，直接把 LocalNet 输出的 6‑D pose (3 × 3 R + t) 转 Marker。
-  2. 移除 collision detect / NMS，只做算法原始输出可视化，方便离线评估。
-"""
-import os
-import sys
-import time
-import argparse
-from typing import List, Tuple, Optional
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image, CameraInfo
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point, Pose
+from cv_bridge import CvBridge
+import message_filters
+from grasp_msgs.srv import GetGrasp  # 你的自定义服务
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from cv_bridge import CvBridge
+import random
+import cv2
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
-from sensor_msgs.msg import Image
-from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Pose
-from tf_transformations import quaternion_from_matrix
-from grasp_msgs.srv import GetGrasp
+from tf_transformations import quaternion_matrix, quaternion_from_matrix
 
-# ───── Anchor‑Local 依赖 ─────
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.extend([
-    os.path.join(ROOT_DIR, 'models'),
-    os.path.join(ROOT_DIR, 'dataset'),
-    os.path.join(ROOT_DIR, 'dataset', 'config'),
-])
-from dataset.config import get_camera_intrinsic
 from dataset.evaluation import (
-    anchor_output_process, detect_2d_grasp, detect_6d_grasp_multi,
+    anchor_output_process,
+    collision_detect,
+    detect_2d_grasp,
+    detect_6d_grasp_multi
 )
-from dataset.pc_dataset_tools import (
-        feature_fusion, data_process
-)
+from dataset.pc_dataset_tools import data_process, feature_fusion
 from models.anchornet import AnchorGraspNet
 from models.localgraspnet import PointMultiGraspNet
 
-# ───── argparse ─────
-print('Loading AnchorPoseNode...')
-def parse_args():
-    p = argparse.ArgumentParser('anchor_grasp_ros2_node_pose')
-    p.add_argument('--checkpoint_path', required=True)
-    # Anchor & Local
-    p.add_argument('--ratio', type=int, default=8)
-    p.add_argument('--anchor_k', type=int, default=6)
-    p.add_argument('--anchor_num', type=int, default=13)
-    p.add_argument('--anchor_w', type=float, default=50.0)
-    p.add_argument('--anchor_z', type=float, default=20.0)
-    p.add_argument('--grid_size', type=int, default=8)
-    p.add_argument('--sigma', type=int, default=10)
-    p.add_argument('--heatmap_thres', type=float, default=0.01)
-    p.add_argument('--local_k', type=int, default=10)
-    # Point cloud
-    p.add_argument('--all_points_num', type=int, default=40000)
-    p.add_argument('--center_num', type=int, default=1024)
-    p.add_argument('--group_num', type=int, default=32)
-    # Image size fed to AnchorNet
-    p.add_argument('--input_w', type=int, default=320)
-    p.add_argument('--input_h', type=int, default=180)
-    # Misc
-    p.add_argument('--random_seed', type=int, default=123)
-    return p.parse_args()
-
-# ───── PointCloud Helper ─────
 
 class PointCloudHelper:
-    """深度 → 点云 / xyz map (与原算法保持同维度)"""
+    def __init__(self,
+                 all_points_num: int,
+                 fx: float, fy: float,
+                 cx: float, cy: float,
+                 width: int = 1280, height: int = 720,
+                 input_w: int = 640, input_h: int = 360,
+                 grid_size: int = 8):
+        self.all_points_num = all_points_num
+        self.fx, self.fy, self.cx, self.cy = fx, fy, cx, cy
+        self.width, self.height = width, height
+        self.input_w, self.input_h = input_w, input_h
+        self.grid_size = grid_size
 
-    def __init__(self, n_points: int, ds_shape: Tuple[int, int] = (80, 45)):
-        self.n_points = n_points
-        self.ds_shape = ds_shape  # (W_ds, H_ds)
-        K = get_camera_intrinsic()
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-        # full‑res map (1280×720)
-        ymap, xmap = np.meshgrid(np.arange(720), np.arange(1280))
-        self.x_full = torch.from_numpy((xmap - cx) / fx).float()
-        self.y_full = torch.from_numpy((ymap - cy) / fy).float()
-        # downscale map
-        h_ds = ds_shape[1]; w_ds = ds_shape[0]
-        ymap_ds, xmap_ds = np.meshgrid(np.arange(h_ds), np.arange(w_ds))
-        factor = 1280 / w_ds
-        self.x_ds = torch.from_numpy((xmap_ds - cx / factor) / (fx / factor)).float()
-        self.y_ds = torch.from_numpy((ymap_ds - cy / factor) / (fy / factor)).float()
+        # full‐resolution x,y maps
+        xmap, ymap = np.meshgrid(
+            np.arange(self.width),
+            np.arange(self.height),
+            indexing='ij'
+        )
+        self.points_x = torch.from_numpy((xmap - cx) / fx).float()
+        self.points_y = torch.from_numpy((ymap - cy) / fy).float()
 
-    def to_point_cloud(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
-        """返回 (1, N, 6) xyzrgb"""
-        dev = depth.device
-        z = depth / 1000.0
-        x = self.x_full.to(dev) * z
-        y = self.y_full.to(dev) * z
-        mask = depth > 0
-        xyz = torch.stack([x[0], y[0], z[0]], -1)[mask[0]]  # (M,3)
-        rgb_pts = rgb[0].permute(1, 2, 0)[mask[0]]          # (M,3)
-        if xyz.shape[0] >= self.n_points:
-            sel = torch.randperm(xyz.shape[0], device=dev)[:self.n_points]
-            xyz = xyz[sel]; rgb_pts = rgb_pts[sel]
-        pc = torch.zeros((1, self.n_points, 6), device=dev) - 1
-        pc[0, :xyz.shape[0], :3] = xyz
-        pc[0, :xyz.shape[0], 3:] = rgb_pts
-        return pc
+        # downsampled maps for xyz‐map generation
+        wd = self.input_w // self.grid_size
+        hd = self.input_h // self.grid_size
+        self.output_shape = (wd, hd)
+        xmap_d, ymap_d = np.meshgrid(
+            np.arange(wd),
+            np.arange(hd),
+            indexing='ij'
+        )
+        fx_d = fx * (wd / self.width)
+        fy_d = fy * (hd / self.height)
+        cx_d = cx * (wd / self.width)
+        cy_d = cy * (hd / self.height)
+        self.points_x_downscale = torch.from_numpy((xmap_d - cx_d) / fx_d).float()
+        self.points_y_downscale = torch.from_numpy((ymap_d - cy_d) / fy_d).float()
 
-    def to_xyz_map(self, depth: torch.Tensor) -> torch.Tensor:
-        depth_ds = F.interpolate(depth.unsqueeze(1), size=self.ds_shape[::-1], mode='nearest').squeeze(1)
-        z = depth_ds / 1000.0
-        dev = depth.device
-        x = self.x_ds.to(dev) * z
-        y = self.y_ds.to(dev) * z
-        return torch.stack([x, y, z], 1)  # (1,3,H_ds,W_ds)
+    def to_scene_points(self,
+                        rgbs: torch.Tensor,
+                        depths: torch.Tensor,
+                        include_rgb: bool = True):
+        batch_size = rgbs.shape[0]
+        feat_dim = 3 + (3 if include_rgb else 0)
+        pts_all = -torch.ones((batch_size, self.all_points_num, feat_dim),
+                              dtype=torch.float32, device=rgbs.device)
+        masks = (depths > 0)
+        zs = depths / 1000.0
+        xs = self.points_x.to(rgbs.device) * zs
+        ys = self.points_y.to(rgbs.device) * zs
 
-# ───── Node ─────
+        for b in range(batch_size):
+            pts = torch.stack([xs[b], ys[b], zs[b]], dim=-1).reshape(-1, 3)
+            m = masks[b].reshape(-1)
+            pts = pts[m]
+            if include_rgb:
+                cols = rgbs[b].reshape(3, -1).T
+                cols = cols[m]
+            n_pts = pts.shape[0]
+            if n_pts >= self.all_points_num:
+                idxs = random.sample(range(n_pts), self.all_points_num)
+            else:
+                idxs = random.choices(range(n_pts), k=self.all_points_num)
+            sel = torch.tensor(idxs, device=pts.device)
+            pts = pts[sel]
+            if include_rgb:
+                cols = cols[sel]
+                pts_all[b] = torch.cat([pts, cols], dim=1)
+            else:
+                pts_all[b] = pts
+        return pts_all
 
-class AnchorPoseNode(Node):
+    def to_xyz_maps(self, depths: torch.Tensor):
+        depths = depths.unsqueeze(1)
+        down = F.interpolate(depths,
+                             size=self.output_shape,
+                             mode='nearest').squeeze(1)
+        zs = down / 1000.0
+        xs = self.points_x_downscale.to(zs.device) * zs
+        ys = self.points_y_downscale.to(zs.device) * zs
+        xyz = torch.stack([xs, ys, zs], dim=1)
+        return xyz
 
-    def __init__(self, cfg):
-        super().__init__('anchor_pose_node')
-        self.cfg = cfg
+
+class GraspNode(Node):
+    def __init__(self):
+        super().__init__('grasp_node')
+        # Parameters
+        self.declare_parameter('color_topic', '/camera/d435/color/image_raw')
+        self.declare_parameter('depth_topic', '/camera/d435/aligned_depth_to_color/image_raw')
+        self.declare_parameter('camera_info_topic', '/camera/d435/color/camera_info')
+        self.declare_parameter('checkpoint_path', './checkpoints/HGGD_realsense_checkpoint')
+        self.declare_parameter('all_points_num', 25600)
+        self.declare_parameter('anchor_num', 7)
+        self.declare_parameter('ratio', 8)
+        self.declare_parameter('anchor_k', 6)
+        self.declare_parameter('anchor_w', 50.0)
+        self.declare_parameter('anchor_z', 20.0)
+        self.declare_parameter('grid_size', 8)
+        self.declare_parameter('input_h', 360)
+        self.declare_parameter('input_w', 640)
+        self.declare_parameter('center_num', 48)
+        self.declare_parameter('group_num', 512)
+        self.declare_parameter('local_k', 10)
+        self.declare_parameter('heatmap_thres', 0.01)
+        self.declare_parameter('sigma', 10)
+
+        # Topics
+        ct = self.get_parameter('color_topic').value
+        dt = self.get_parameter('depth_topic').value
+        cit = self.get_parameter('camera_info_topic').value
+
         self.bridge = CvBridge()
-        self.rgb: Optional[torch.Tensor] = None
-        self.depth: Optional[torch.Tensor] = None
-        # QoS
-        qos = QoSProfile(depth=10)
-        qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
-        qos.durability = QoSDurabilityPolicy.VOLATILE
-        self.create_subscription(Image, '/camera/d435/color/image_raw', self._cb_rgb, qos)
-        self.create_subscription(Image, '/camera/d435/aligned_depth_to_color/image_raw', self._cb_depth, qos)
-        self.marker_pub = self.create_publisher(Marker, '/grasp_markers', qos)
-        self.create_service(GetGrasp, 'get_grasps', self._srv_grasp)
-        # Helper & model
-        self.pc_helper = PointCloudHelper(cfg.all_points_num)
-        torch.manual_seed(cfg.random_seed)
-        self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.anchor_net = AnchorGraspNet(in_dim=4, ratio=cfg.ratio, anchor_k=cfg.anchor_k).to(self.dev)
-        self.local_net = PointMultiGraspNet(info_size=3, k_cls=cfg.anchor_num**2).to(self.dev)
-        self._load_ckpt(cfg.checkpoint_path)
-        # anchor bins for detect_6d
-        basic = torch.linspace(-1, 1, cfg.anchor_num + 1, device=self.dev)
-        self.anchors = {'gamma': (basic[1:] + basic[:-1]) / 2,
-                        'beta':  (basic[1:] + basic[:-1]) / 2}
-        self.get_logger().info('AnchorPoseNode ready.')
+        self.marker_pub = self.create_publisher(MarkerArray, 'grasp_markers', 10)
 
-    # ───── Callbacks ─────
-    def _cb_rgb(self, msg):
-        try:
-            arr = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
-            self.rgb = (torch.from_numpy(arr).permute(2, 1, 0).float() / 255.0).unsqueeze(0).to(self.dev)
-        except Exception as e:
-            self.get_logger().error(f'RGB error: {e}')
+        self.camera_info = None
+        self.create_subscription(CameraInfo, cit, self.camera_info_cb, 10)
 
-    def _cb_depth(self, msg):
-        try:
-            arr = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
-            if arr.dtype != np.uint16:
-                arr = (arr * 1000.0).astype(np.uint16)
-            self.depth = torch.from_numpy(arr).float().T.unsqueeze(0).to(self.dev)
-        except Exception as e:
-            self.get_logger().error(f'Depth error: {e}')
+        self.color_sub = message_filters.Subscriber(self, Image, ct)
+        self.depth_sub = message_filters.Subscriber(self, Image, dt)
+        ats = message_filters.ApproximateTimeSynchronizer(
+            [self.color_sub, self.depth_sub], queue_size=10, slop=0.05
+        )
+        ats.registerCallback(self.image_cb)
 
-    # ───── Service ─────
-    def _srv_grasp(self, req, res):
-        if req.input != 'start_grasp':
-            res.success = False; res.output.markers = []; return res
-        if not self._ensure_frames():
-            res.success = False; res.output.markers = []; return res
-        try:
-            markers = self._infer_and_publish()
-            res.success = bool(markers)
-            res.output.markers = markers
-        except Exception as e:
-            self.get_logger().error(f'Inference fail: {e}')
-            res.success = False; res.output.markers = []
-        return res
+        self.pc_helper = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.anchornet = None
+        self.localnet = None
+        self.anchors = None
 
-    # ───── Helpers ─────
-    def _ensure_frames(self):
-        t0 = time.time()
-        while (self.rgb is None or self.depth is None) and (time.time() - t0 < 3.0):
-            rclpy.spin_once(self, timeout_sec=0.05)
-        return self.rgb is not None and self.depth is not None
+        # 缓存最新的 RGB/Depth
+        self.latest_rgb   = None
+        self.latest_depth = None
 
-    def _load_ckpt(self, path):
-        ckpt = torch.load(path, map_location=self.dev)
-        self.anchor_net.load_state_dict(ckpt['anchor'])
-        self.local_net.load_state_dict(ckpt['local'])
-        self.anchors['gamma'] = ckpt['gamma']; self.anchors['beta'] = ckpt['beta']
-        self.anchor_net.eval(); self.local_net.eval()
-        self.get_logger().info(f'Loaded ckpt: {os.path.basename(path)}')
+        # 在 __init__ 结尾，创建一个 GetGrasp 服务
+        self.srv = self.create_service(
+            GetGrasp,
+            'get_grasps',
+            self.get_grasps_callback
+        )
 
-    # ───── Inference ─────
-    def _infer_and_publish(self) -> List[Marker]:
-        cfg = self.cfg
-        # →预处理
-        rgb_ds = F.interpolate(self.rgb, (cfg.input_w, cfg.input_h))
-        depth_ds = F.interpolate(self.depth.unsqueeze(1), (cfg.input_w, cfg.input_h), mode='nearest').squeeze(1)
-        depth_norm = torch.clip(depth_ds / 1000.0 - (depth_ds / 1000.0).mean(), -1, 1)
-        x = torch.cat([depth_norm.unsqueeze(1), rgb_ds], 1)
-        # →AnchorNet
+    def camera_info_cb(self, msg: CameraInfo):
+        if self.camera_info is None:
+            self.camera_info = msg
+            self.get_logger().info('Got CameraInfo, building models…')
+            self.build_models()
+
+    def build_models(self):
+        k = self.camera_info.k
+        fx, fy = k[0], k[4]
+        cx, cy = k[2], k[5]
+
+        self.pc_helper = PointCloudHelper(
+            all_points_num=self.get_parameter('all_points_num').value,
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            width=self.camera_info.width,
+            height=self.camera_info.height,
+            input_w=self.get_parameter('input_w').value,
+            input_h=self.get_parameter('input_h').value,
+            grid_size=self.get_parameter('grid_size').value
+        )
+
+        self.anchornet = AnchorGraspNet(
+            in_dim=4,
+            ratio=self.get_parameter('ratio').value,
+            anchor_k=self.get_parameter('anchor_k').value
+        ).to(self.device)
+        self.localnet = PointMultiGraspNet(
+            info_size=3,
+            k_cls=self.get_parameter('anchor_num').value**2
+        ).to(self.device)
+
+        ckpt = torch.load(self.get_parameter('checkpoint_path').value,
+                          map_location=self.device)
+        self.anchornet.load_state_dict(ckpt['anchor'])
+        self.localnet.load_state_dict(ckpt['local'])
+
+        arange = torch.linspace(-1, 1,
+                                self.get_parameter('anchor_num').value + 1
+                               ).to(self.device)
+        self.anchors = {
+            'gamma': ckpt['gamma'].to(self.device),
+            'beta':  ckpt['beta'].to(self.device)
+        }
+
+        self.anchornet.eval()
+        self.localnet.eval()
+        self.get_logger().info('Models loaded and ready.')
+
+    def image_cb(self, color_msg: Image, depth_msg: Image):
+        # 1) 解码并缓存最新的图像／深度
+        cv_color = self.bridge.imgmsg_to_cv2(color_msg, 'bgr8')
+        cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        self.latest_rgb   = cv2.cvtColor(cv_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        self.latest_depth = cv_depth.astype(np.float32)
+
+    def get_grasps_callback(self, request, response):
+        # 只对特定命令触发推理
+        if request.input != 'start_grasp':
+            response.success = False
+            response.output.markers = MarkerArray().markers
+            return response
+
+        # 确保已有一帧缓存
+        if self.latest_rgb is None or self.latest_depth is None:
+            self.get_logger().warn("No image+depth buffered yet")
+            response.success = False
+            response.output.markers = MarkerArray().markers
+            return response
+
+        # —— 下面直接复用原来 image_cb 里的推理 pipeline —— #
+        # 1) 转 torch.Tensor
+        ori_rgb = torch.from_numpy(self.latest_rgb).permute(2,1,0)[None]\
+                      .to(self.device, dtype=torch.float32)
+        ori_depth = torch.from_numpy(self.latest_depth).T[None]\
+                        .to(self.device, dtype=torch.float32)
+
+        view_pts = self.pc_helper.to_scene_points(ori_rgb, ori_depth, include_rgb=True)
+        xyzs     = self.pc_helper.to_xyz_maps(ori_depth)
+
+        #    —— 首先对深度做原始范围截断（0–1500 mm），再转换到米，并中心化后 clip 到 [-2,2]
+        rgb_in = F.interpolate(
+            ori_rgb,
+            size=(self.get_parameter('input_w').value,
+                self.get_parameter('input_h').value)
+        )
+        depth_in = F.interpolate(
+            ori_depth.unsqueeze(1),
+            size=(self.get_parameter('input_w').value,
+                self.get_parameter('input_h').value),
+            mode='nearest'
+        ).squeeze(1)
+
+        # ① 原始 mm 范围截断
+        depth_in = torch.clamp(depth_in, 0.0, 2000.0)
+        # ② 转成 米
+        depth_in = depth_in / 1000.0
+        # ③ 中心化（减掉图像平均值）
+        depth_in = depth_in - depth_in.mean()
+        # ④ 截断到 [-2,2]
+        depth_in = torch.clamp(depth_in, -1, 1)
+
+        # 最后拼成 (B,4,H,W) 的网络输入
+        x = torch.cat([depth_in.unsqueeze(1), rgb_in], dim=1)
+
+        # 4) 前向推理 + 2D→6D → collision → nms
         with torch.no_grad():
-            pred_2d, per_feat = self.anchor_net(x)
-        loc_map, cls_mask, theta_off, h_off, w_off = anchor_output_process(*pred_2d, sigma=cfg.sigma)
-        rect_gg = detect_2d_grasp(loc_map, cls_mask, theta_off, h_off, w_off,
-                                  ratio=cfg.ratio, anchor_k=cfg.anchor_k, anchor_w=cfg.anchor_w,
-                                  anchor_z=cfg.anchor_z, mask_thre=cfg.heatmap_thres,
-                                  center_num=cfg.center_num, grid_size=cfg.grid_size,
-                                  grasp_nms=cfg.grid_size, reduce='max')
-        if rect_gg.size == 0:
-            self.get_logger().info('No grasp found'); return []
-        # →Point cloud & xyz map
-        pc = self.pc_helper.to_point_cloud(self.rgb, self.depth)
-        xyzs = self.pc_helper.to_xyz_map(self.depth)
-        fusion = feature_fusion(pc[..., :3], per_feat, xyzs)
-        pc_group, valid_centers = data_process(fusion, self.depth, [rect_gg],
-                                               cfg.center_num, cfg.group_num,
-                                               (cfg.input_w, cfg.input_h),
-                                               min_points=32, is_training=False)
-        grasp_info = torch.tensor(np.vstack([rect_gg.thetas, rect_gg.widths, rect_gg.depths]).T,
-                                  dtype=torch.float32, device=self.dev)
-        # →LocalNet
-        with torch.no_grad():
-            _, pred_cls, offset = self.local_net(pc_group, grasp_info)
-        _, rect_6d = detect_6d_grasp_multi(rect_gg, pred_cls, offset, valid_centers,
-                                           (cfg.input_w, cfg.input_h), self.anchors, k=cfg.local_k)
-        # rect_6d 内含 rotation_mats (M,3,3) & translations (M,3)
-        Rs: torch.Tensor = rect_6d.rotation_mats  # type: ignore
-        Ts: torch.Tensor = rect_6d.translations   # type: ignore
-        markers: List[Marker] = []
-        for i in range(Rs.shape[0]):
-            markers.append(self._pose_to_marker(Rs[i].cpu().numpy(), Ts[i].cpu().numpy(), i))
-            self.marker_pub.publish(markers[-1])
-        self.get_logger().info(f'Published {len(markers)} grasp markers')
-        return markers
+            p2d, feat = self.anchornet(x)
+            loc_map, cls_mask, th_off, h_off, w_off = anchor_output_process(
+                *p2d, sigma=self.get_parameter('sigma').value
+            )
+            rect_gg = detect_2d_grasp(
+                loc_map, cls_mask, th_off, h_off, w_off,
+                ratio=self.get_parameter('ratio').value,
+                anchor_k=self.get_parameter('anchor_k').value,
+                anchor_w=self.get_parameter('anchor_w').value,
+                anchor_z=self.get_parameter('anchor_z').value,
+                mask_thre=self.get_parameter('heatmap_thres').value,
+                center_num=self.get_parameter('center_num').value,
+                grid_size=self.get_parameter('grid_size').value,
+                grasp_nms=self.get_parameter('grid_size').value,
+                reduce='max'
+            )
+            if rect_gg.size == 0:
+                response.success = False
+                response.output.markers = MarkerArray().markers
+                return response
 
-    # ───── Pose→Marker ─────
-    def _pose_to_marker(self, R: np.ndarray, t: np.ndarray, idx: int) -> Marker:
+            pts_all = feature_fusion(view_pts[..., :3], feat, xyzs)
+            pcg, valid_centers = data_process(
+                pts_all, ori_depth, [rect_gg],
+                self.get_parameter('center_num').value,
+                self.get_parameter('group_num').value,
+                (self.get_parameter('input_w').value,
+                 self.get_parameter('input_h').value),
+                min_points=32,
+                is_training=False
+            )
+            # 对齐 gi
+            g_t = torch.from_numpy(rect_gg.thetas).to(self.device, dtype=torch.float32)
+            g_w = torch.from_numpy(rect_gg.widths).to(self.device, dtype=torch.float32)
+            g_d = torch.from_numpy(rect_gg.depths).to(self.device, dtype=torch.float32)
+            gi  = torch.stack([g_t, g_w, g_d], dim=1)  # → FloatTensor on self.device
+
+            _, pred_loc, off = self.localnet(pcg, gi)
+            _, rect6 = detect_6d_grasp_multi(
+                rect_gg, pred_loc, off, valid_centers,
+                (self.get_parameter('input_w').value,
+                 self.get_parameter('input_h').value),
+                self.anchors, k=self.get_parameter('local_k').value
+            )
+            gg, _ = collision_detect(
+                pts_all.squeeze(0),
+                rect6.to_6d_grasp_group(depth=0.02),
+                mode='graspnet'
+            )
+            gg = gg.nms()
+
+        # 5) 根据结果构造 MarkerArray 并填入 response
+        ma = MarkerArray()
+        for i, g in enumerate(gg):
+            ma.markers.append(self._grasp_to_marker(g, i))
+        self.marker_pub.publish(ma)
+        response.output.markers = ma.markers
+        response.success = True
+        return response
+
+
+    def _grasp_to_pose(self, g):
+        """
+        把一个 Grasp 对象 g 转成 geometry_msgs/Pose
+        """
+        # 1) 取旋转
+        rot = g.rotation
+        if isinstance(rot, torch.Tensor):
+            R = rot.cpu().numpy()
+        else:
+            R = rot
+
+        # 2) 取平移
+        trans = g.translation
+        if isinstance(trans, torch.Tensor):
+            t = trans.cpu().numpy()
+        else:
+            t = trans
+
+        # 3) 构造 Pose
         pose = Pose()
         pose.position.x, pose.position.y, pose.position.z = map(float, t)
-        R_adj = -R  # 翻转 +Z 方向
-        homo = np.eye(4); homo[:3, :3] = R_adj
+        # Z 轴需要翻转
+        homo = np.eye(4)
+        homo[:3, :3] = -R
         qx, qy, qz, qw = quaternion_from_matrix(homo)
-        pose.orientation.x = qx; pose.orientation.y = qy; pose.orientation.z = qz; pose.orientation.w = qw
+        pose.orientation.x = qx
+        pose.orientation.y = qy
+        pose.orientation.z = qz
+        pose.orientation.w = qw
+        return pose
+    
+    def _grasp_to_marker(self, grasp, idx):
+        pose = self._grasp_to_pose(grasp)
         m = Marker()
         m.header.frame_id = 'd435_color_optical_frame'
-        m.header.stamp = self.get_clock().now().to_msg()
-        m.ns = 'grasp_markers'; m.id = idx; m.type = Marker.CUBE; m.action = Marker.ADD
-        m.scale.x = m.scale.y = m.scale.z = 0.05
-        m.color.r = m.color.g = m.color.b = m.color.a = 1.0
-        m.pose = pose
+        m.ns = 'grasp_markers'
+        m.id = idx
+        m.type   = Marker.ARROW
+        m.action = Marker.ADD
+        m.pose   = pose
+        # 长度和粗细
+        m.scale.x = 0.1  # 箭头长度
+        m.scale.y = 0.01 # 箭杆直径
+        m.scale.z = 0.02 # 箭头直径
+        print("grasps",idx,":",pose,"score:",grasp.score)
+        # 颜色
+        m.color.r = 1.0; m.color.g = 0.0; m.color.b = 0.0; m.color.a = grasp.score
         return m
 
-# ───── main ─────
-
-def main():
-    cfg = parse_args()
-    rclpy.init()
-    node = AnchorPoseNode(cfg)
+def main(args=None):
+    rclpy.init(args=args)
+    node = GraspNode()
     try:
         rclpy.spin(node)
     finally:
-        node.destroy_node(); rclpy.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
